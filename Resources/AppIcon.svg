@@ -1,0 +1,40 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024">
+  <defs>
+    <linearGradient id="bg" x1="160" y1="92" x2="864" y2="932" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#20242A"/>
+      <stop offset="1" stop-color="#0D1116"/>
+    </linearGradient>
+    <linearGradient id="case" x1="292" y1="102" x2="732" y2="922" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#343B44"/>
+      <stop offset="1" stop-color="#12171D"/>
+    </linearGradient>
+    <filter id="shadow" x="-30%" y="-30%" width="160%" height="170%">
+      <feDropShadow dx="0" dy="34" stdDeviation="34" flood-color="#000000" flood-opacity="0.40"/>
+    </filter>
+    <filter id="glow-yellow" x="-60%" y="-60%" width="220%" height="220%">
+      <feGaussianBlur stdDeviation="20" result="blur"/>
+      <feMerge>
+        <feMergeNode in="blur"/>
+        <feMergeNode in="SourceGraphic"/>
+      </feMerge>
+    </filter>
+    <filter id="glow-green" x="-60%" y="-60%" width="220%" height="220%">
+      <feGaussianBlur stdDeviation="20" result="blur"/>
+      <feMerge>
+        <feMergeNode in="blur"/>
+        <feMergeNode in="SourceGraphic"/>
+      </feMerge>
+    </filter>
+  </defs>
+  <rect width="1024" height="1024" rx="224" fill="url(#bg)"/>
+  <path d="M360 94h304c76 0 138 62 138 138v560c0 76-62 138-138 138H360c-76 0-138-62-138-138V232c0-76 62-138 138-138Z" fill="url(#case)" filter="url(#shadow)"/>
+  <path d="M364 142h296c47 0 86 39 86 86v568c0 47-39 86-86 86H364c-47 0-86-39-86-86V228c0-47 39-86 86-86Z" fill="none" stroke="#48515B" stroke-width="18" opacity=".72"/>
+  <circle cx="512" cy="292" r="98" fill="#4E5965"/>
+  <circle cx="512" cy="292" r="70" fill="#941F24" opacity=".75"/>
+  <circle cx="512" cy="512" r="112" fill="#FFE08A" opacity=".18" filter="url(#glow-yellow)"/>
+  <circle cx="512" cy="512" r="96" fill="#FFB41F"/>
+  <circle cx="486" cy="482" r="24" fill="#FFF4C7" opacity=".82"/>
+  <circle cx="512" cy="734" r="110" fill="#71F29A" opacity=".17" filter="url(#glow-green)"/>
+  <circle cx="512" cy="734" r="94" fill="#37D366"/>
+  <circle cx="486" cy="706" r="23" fill="#D9FFE4" opacity=".82"/>
+</svg>

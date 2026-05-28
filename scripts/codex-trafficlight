@@ -1,0 +1,369 @@
+#!/usr/bin/env python3
+import json
+import os
+import shlex
+import shutil
+import sys
+from datetime import datetime, timezone
+from pathlib import Path
+
+
+STATUS_DIR = Path("/private/tmp") / f"codex-trafficlight-{os.getuid()}"
+STATUS_FILE = STATUS_DIR / "status.json"
+LEGACY_STATUS_FILE = Path.home() / "Library" / "Application Support" / "CodexTrafficLight" / "status.json"
+HOOKS_FILE = Path.home() / ".codex" / "hooks.json"
+VALID_STATES = {"working", "approval", "complete", "error", "idle", "unknown"}
+HOOK_EVENTS = [
+    "UserPromptSubmit",
+    "SessionStart",
+    "PreToolUse",
+    "PostToolUse",
+    "Notification",
+    "PermissionRequest",
+    "Stop",
+    "SessionEnd",
+]
+
+
+def local_now():
+    return datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds")
+
+
+def read_stdin():
+    if sys.stdin.isatty():
+        return ""
+    return sys.stdin.read()
+
+
+def as_json(raw):
+    if not raw.strip():
+        return {}
+    try:
+        value = json.loads(raw)
+        return value if isinstance(value, dict) else {"payload": value}
+    except json.JSONDecodeError:
+        return {"raw": raw}
+
+
+def pick(payload, *names):
+    for name in names:
+        value = payload.get(name)
+        if value not in (None, ""):
+            return str(value)
+    return None
+
+
+def pick_event(payload, argv):
+    direct = pick(payload, "hook_event_name", "event_name", "event", "type", "name")
+    if direct:
+        return direct
+    for arg in argv:
+        if arg.startswith("--event="):
+            return arg.split("=", 1)[1]
+    for env_name in ("CODEX_HOOK_EVENT_NAME", "CODEX_HOOK_EVENT", "CLAUDE_HOOK_EVENT_NAME"):
+        value = os.environ.get(env_name)
+        if value:
+            return value
+    return None
+
+
+def source_from_args(argv):
+    for index, arg in enumerate(argv):
+        if arg == "--source" and index + 1 < len(argv):
+            return argv[index + 1]
+        if arg.startswith("--source="):
+            return arg.split("=", 1)[1]
+    return "codex"
+
+
+def contains_approval_signal(event, payload, raw):
+    event_text = (event or "").lower()
+    if "permission" in event_text or "approval" in event_text:
+        return True
+
+    haystack = raw.lower()
+    approval_needles = (
+        "permissionrequest",
+        "require_escalated",
+        "sandbox_permissions",
+        "approval request",
+        "requires approval",
+        "waiting for approval",
+        "awaiting approval",
+        "需要确认",
+        "需要权限",
+        "确认权限",
+    )
+    if any(needle in haystack for needle in approval_needles):
+        return True
+
+    for key in ("requires_approval", "permission_required", "approval_required"):
+        if payload.get(key) is True:
+            return True
+
+    return False
+
+
+def contains_error_signal(event, payload):
+    event_text = (event or "").lower()
+    if "error" in event_text or "failed" in event_text:
+        return True
+
+    for key in ("error", "last_error", "exception", "failure"):
+        value = payload.get(key)
+        if value not in (None, "", False):
+            return True
+
+    if payload.get("success") is False and event in ("Stop", "SessionEnd"):
+        return True
+
+    return False
+
+
+def map_state(event, payload, raw):
+    if contains_approval_signal(event, payload, raw):
+        return "approval"
+    if contains_error_signal(event, payload):
+        return "error"
+
+    compact = (event or "").replace("_", "").replace("-", "").lower()
+    if compact in {"userpromptsubmit", "sessionstart", "pretooluse", "posttooluse", "notification"}:
+        return "working"
+    if compact in {"stop", "sessionend", "subagentstop"}:
+        return "complete"
+    return "working"
+
+
+def build_status(state, event=None, source="codex", message=None, payload=None):
+    payload = payload or {}
+    cwd = pick(payload, "cwd", "workspace", "project_path")
+    thread_id = pick(payload, "thread_id", "session_id", "conversation_id")
+    return {
+        "state": state,
+        "event": event,
+        "source": source,
+        "message": message or message_for_state(state, event),
+        "threadId": thread_id,
+        "workspace": cwd,
+        "updatedAt": local_now(),
+    }
+
+
+def message_for_state(state, event=None):
+    if state == "working":
+        return "Codex 正在处理任务"
+    if state == "approval":
+        return "Codex 正在等待你确认权限"
+    if state == "complete":
+        return "Codex 当前任务已完成"
+    if state == "error":
+        return "Codex 当前任务出现错误"
+    if state == "idle":
+        return "等待 Codex 任务"
+    return event or "状态未知"
+
+
+def write_status(status):
+    STATUS_DIR.mkdir(parents=True, exist_ok=True)
+    temp_file = STATUS_FILE.with_suffix(".json.tmp")
+    temp_file.write_text(json.dumps(status, ensure_ascii=False, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    os.replace(temp_file, STATUS_FILE)
+
+
+def command_hook(argv):
+    raw = read_stdin()
+    payload = as_json(raw)
+    event = pick_event(payload, argv)
+    source = source_from_args(argv)
+    state = map_state(event, payload, raw)
+    write_status(build_status(state, event=event, source=source, payload=payload))
+    return 0
+
+
+def command_set(argv):
+    if not argv or argv[0] not in VALID_STATES:
+        print("usage: codex-trafficlight set working|approval|complete|error|idle|unknown [message]", file=sys.stderr)
+        return 2
+
+    state = argv[0]
+    message = " ".join(argv[1:]).strip() or None
+    write_status(build_status(state, event="manual", source="manual", message=message))
+    print(STATUS_FILE)
+    return 0
+
+
+def command_show():
+    status_file = STATUS_FILE if STATUS_FILE.exists() else LEGACY_STATUS_FILE
+    if not status_file.exists():
+        print("{}")
+        return 0
+    print(status_file.read_text(encoding="utf-8"), end="")
+    return 0
+
+
+def load_hooks():
+    if not HOOKS_FILE.exists():
+        return {"hooks": {}}
+    try:
+        data = json.loads(HOOKS_FILE.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        raise SystemExit(f"hooks.json is not valid JSON: {exc}") from exc
+    if not isinstance(data, dict):
+        raise SystemExit("hooks.json root must be an object")
+    hooks = data.setdefault("hooks", {})
+    if not isinstance(hooks, dict):
+        raise SystemExit("hooks.json hooks must be an object")
+    return data
+
+
+def hook_command(event=None):
+    parts = [str(Path(__file__).resolve()), "hook"]
+    if event:
+        parts.append(f"--event={event}")
+    parts.extend(["--source", "codex"])
+    return " ".join(shlex.quote(part) for part in parts)
+
+
+def is_trafficlight_hook(hook):
+    if not isinstance(hook, dict):
+        return False
+    marker = str(Path(__file__).resolve())
+    return marker in str(hook.get("command", ""))
+
+
+def event_has_command(entries, command):
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        for hook in entry.get("hooks", []):
+            if isinstance(hook, dict) and hook.get("command") == command:
+                return True
+    return False
+
+
+def install_hooks():
+    data = load_hooks()
+    hooks = data.setdefault("hooks", {})
+    marker = str(Path(__file__).resolve())
+    changed = False
+
+    for event in HOOK_EVENTS:
+        entries = hooks.setdefault(event, [])
+        if not isinstance(entries, list):
+            raise SystemExit(f"hooks.{event} must be a list")
+
+        cleaned_entries = []
+        for entry in entries:
+            entry_hooks = entry.get("hooks", []) if isinstance(entry, dict) else []
+            keep_hooks = [hook for hook in entry_hooks if not is_trafficlight_hook(hook)]
+            if len(keep_hooks) != len(entry_hooks):
+                changed = True
+            if keep_hooks:
+                next_entry = dict(entry)
+                next_entry["hooks"] = keep_hooks
+                cleaned_entries.append(next_entry)
+            elif not entry_hooks:
+                cleaned_entries.append(entry)
+        entries = cleaned_entries
+        hooks[event] = entries
+
+        command = hook_command(event)
+        if event_has_command(entries, command):
+            continue
+        entries.append({
+            "hooks": [{
+                "command": command,
+                "timeout": 2,
+                "type": "command",
+            }],
+        })
+        changed = True
+
+    if not changed:
+        print("Codex Traffic Light hooks already installed.")
+        return 0
+
+    HOOKS_FILE.parent.mkdir(parents=True, exist_ok=True)
+    if HOOKS_FILE.exists():
+        backup = HOOKS_FILE.with_name(f"hooks.json.trafficlight-backup-{datetime.now().strftime('%Y%m%d-%H%M%S')}")
+        shutil.copy2(HOOKS_FILE, backup)
+        print(f"Backup: {backup}")
+
+    temp_file = HOOKS_FILE.with_suffix(".json.tmp")
+    temp_file.write_text(json.dumps(data, ensure_ascii=False, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    os.replace(temp_file, HOOKS_FILE)
+    print("Installed Codex Traffic Light hooks.")
+    return 0
+
+
+def uninstall_hooks():
+    data = load_hooks()
+    hooks = data.setdefault("hooks", {})
+    changed = False
+
+    for event, entries in list(hooks.items()):
+        if not isinstance(entries, list):
+            continue
+        next_entries = []
+        for entry in entries:
+            entry_hooks = entry.get("hooks", []) if isinstance(entry, dict) else []
+            keep_hooks = [
+                hook for hook in entry_hooks
+                if not is_trafficlight_hook(hook)
+            ]
+            if len(keep_hooks) != len(entry_hooks):
+                changed = True
+            if keep_hooks:
+                entry = dict(entry)
+                entry["hooks"] = keep_hooks
+                next_entries.append(entry)
+            elif not entry_hooks:
+                next_entries.append(entry)
+        hooks[event] = next_entries
+
+    if not changed:
+        print("No Codex Traffic Light hooks found.")
+        return 0
+
+    backup = HOOKS_FILE.with_name(f"hooks.json.trafficlight-uninstall-backup-{datetime.now().strftime('%Y%m%d-%H%M%S')}")
+    shutil.copy2(HOOKS_FILE, backup)
+    temp_file = HOOKS_FILE.with_suffix(".json.tmp")
+    temp_file.write_text(json.dumps(data, ensure_ascii=False, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    os.replace(temp_file, HOOKS_FILE)
+    print(f"Backup: {backup}")
+    print("Uninstalled Codex Traffic Light hooks.")
+    return 0
+
+
+def main():
+    argv = sys.argv[1:]
+    command = argv[0] if argv else "help"
+    rest = argv[1:]
+
+    if command == "hook":
+        return command_hook(rest)
+    if command == "set":
+        return command_set(rest)
+    if command == "show":
+        return command_show()
+    if command == "path":
+        print(STATUS_FILE)
+        return 0
+    if command == "install-hooks":
+        return install_hooks()
+    if command == "uninstall-hooks":
+        return uninstall_hooks()
+
+    print("""usage:
+  codex-trafficlight hook --source codex
+  codex-trafficlight set working|approval|complete|error|idle|unknown [message]
+  codex-trafficlight show
+  codex-trafficlight path
+  codex-trafficlight install-hooks
+  codex-trafficlight uninstall-hooks
+""", end="")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
