@@ -102,6 +102,7 @@ enum CodexLogMonitor {
     }
 
     private static let recentActivityWindowSeconds: TimeInterval = 15
+    private static let completionDebounceSeconds: TimeInterval = 8
 
     private static var logsDatabase: URL {
         FileManager.default.homeDirectoryForCurrentUser
@@ -131,12 +132,6 @@ enum CodexLogMonitor {
             return nil
         }
 
-        if fileStatus.source != "codex-log",
-           (fileStatus.state == .working || fileStatus.state == .approval),
-           status.state == .complete {
-            return nil
-        }
-
         return status
     }
 
@@ -163,7 +158,7 @@ enum CodexLogMonitor {
         }
 
         if let latestMainResponse {
-            return status(for: latestMainResponse.event, row: latestMainResponse.row)
+            return status(for: latestMainResponse.event, row: latestMainResponse.row, latestActivity: latestActivity)
         }
 
         if let latestActivity, Date().timeIntervalSince(latestActivity.date) < recentActivityWindowSeconds {
@@ -181,7 +176,7 @@ enum CodexLogMonitor {
         return nil
     }
 
-    private static func status(for event: ResponseEvent, row: LogRow) -> CodexStatus? {
+    private static func status(for event: ResponseEvent, row: LogRow, latestActivity: LogRow?) -> CodexStatus? {
         switch event {
         case .inProgress:
             return CodexStatus(
@@ -204,7 +199,17 @@ enum CodexLogMonitor {
                 updatedAt: isoString(from: row.date)
             )
         case .completed:
-            return nil
+            let newestActivityDate = [row.date, latestActivity?.date].compactMap { $0 }.max() ?? row.date
+            let isStable = Date().timeIntervalSince(newestActivityDate) >= completionDebounceSeconds
+            return CodexStatus(
+                state: isStable ? .complete : .working,
+                event: "response.completed",
+                source: "codex-log",
+                message: isStable ? "Codex 响应完成" : "Codex 正在收尾",
+                threadId: row.threadId,
+                workspace: nil,
+                updatedAt: isoString(from: newestActivityDate)
+            )
         }
     }
 
