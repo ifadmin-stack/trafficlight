@@ -61,3 +61,20 @@ Hook 会和你现有的 `~/.codex/hooks.json` 配置合并，并先生成备份�
 /Users/qingfeng/Documents/trafficlight/scripts/codex-trafficlight set complete "任务已完成"
 /Users/qingfeng/Documents/trafficlight/scripts/codex-trafficlight set error "任务出错"
 ```
+
+## 自动发布 `.dmg`（GitHub Release）
+
+仓库已配置 GitHub Actions：推送版本 tag 后会自动构建并上传 `.dmg` 到 Release。
+
+```bash
+git tag v0.1.0
+git push origin v0.1.0
+```
+
+完成后可在 GitHub 的 Release 页面下载类似文件：
+
+```text
+CodexTrafficLight-macos-arm64-0.1.0.dmg
+```
+
+> 当前产物为 Apple Silicon (`arm64`)。

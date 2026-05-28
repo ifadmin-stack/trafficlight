@@ -1,0 +1,42 @@
+name: Release DMG
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-release:
+    name: Build and publish DMG
+    runs-on: macos-14
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Ensure scripts are executable
+        run: chmod +x ./scripts/build-app-bundle
+
+      - name: Build app bundle
+        run: ./scripts/build-app-bundle
+
+      - name: Package DMG
+        id: package
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          DMG_NAME="CodexTrafficLight-macos-arm64-${VERSION}.dmg"
+          hdiutil create \
+            -volname "CodexTrafficLight" \
+            -srcfolder ".build/CodexTrafficLight.app" \
+            -ov -format UDZO \
+            "$DMG_NAME"
+          echo "dmg_name=$DMG_NAME" >> "$GITHUB_OUTPUT"
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ steps.package.outputs.dmg_name }}
+          generate_release_notes: true
