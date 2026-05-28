@@ -85,6 +85,24 @@ enum StatusPaths {
 }
 
 enum CodexLogMonitor {
+    private struct LogRow {
+        let ts: Int64
+        let body: String
+        let threadId: String?
+
+        var date: Date {
+            Date(timeIntervalSince1970: TimeInterval(ts))
+        }
+    }
+
+    private enum ResponseEvent {
+        case inProgress
+        case completed
+        case failed
+    }
+
+    private static let recentActivityWindowSeconds: TimeInterval = 15
+
     private static var logsDatabase: URL {
         FileManager.default.homeDirectoryForCurrentUser
             .appendingPathComponent(".codex", isDirectory: true)
@@ -95,73 +113,154 @@ enum CodexLogMonitor {
         let query = """
         select ts, feedback_log_body, thread_id
         from logs
-        where feedback_log_body like '%response.in_progress%'
-           or feedback_log_body like '%response.completed%'
-           or feedback_log_body like '%response.failed%'
         order by ts desc, ts_nanos desc, id desc
-        limit 1;
+        limit 220;
         """
 
-        guard let row = queryLatestRow(query) else {
+        let rows = queryRecentRows(query)
+        guard let firstInteresting = rows.first(where: { isInteresting($0.body) }) else {
             return nil
         }
 
-        let logDate = Date(timeIntervalSince1970: TimeInterval(row.ts))
+        let logDate = firstInteresting.date
         if let fileDate = parseDate(fileStatus.updatedAt), fileDate > logDate {
             return nil
         }
 
-        let state: CodexState
-        let message: String
-        let event: String
-        if row.body.contains("response.in_progress") {
-            state = .working
-            message = "Codex 正在响应"
-            event = "response.in_progress"
-        } else if row.body.contains("response.failed") {
-            state = .error
-            message = "Codex 响应出错"
-            event = "response.failed"
-        } else if row.body.contains("response.completed") {
-            state = .complete
-            message = "Codex 响应完成"
-            event = "response.completed"
-        } else {
+        guard let status = inferStatus(from: rows) else {
             return nil
         }
 
-        return CodexStatus(
-            state: state,
-            event: event,
-            source: "codex-log",
-            message: message,
-            threadId: row.threadId,
-            workspace: nil,
-            updatedAt: isoString(from: logDate)
-        )
+        if fileStatus.source != "codex-log",
+           (fileStatus.state == .working || fileStatus.state == .approval),
+           status.state == .complete {
+            return nil
+        }
+
+        return status
     }
 
-    private static func queryLatestRow(_ query: String) -> (ts: Int64, body: String, threadId: String?)? {
+    private static func inferStatus(from rows: [LogRow]) -> CodexStatus? {
+        var latestActivity: LogRow?
+        var latestMainResponse: (row: LogRow, event: ResponseEvent)?
+
+        for row in rows {
+            let body = row.body
+            guard isInteresting(body) else {
+                continue
+            }
+
+            if latestActivity == nil && isActivity(body) {
+                latestActivity = row
+            }
+
+            guard !isAutoReview(body), let event = responseEvent(body) else {
+                continue
+            }
+
+            latestMainResponse = (row, event)
+            break
+        }
+
+        if let latestMainResponse {
+            return status(for: latestMainResponse.event, row: latestMainResponse.row)
+        }
+
+        if let latestActivity, Date().timeIntervalSince(latestActivity.date) < recentActivityWindowSeconds {
+            return CodexStatus(
+                state: .working,
+                event: "activity",
+                source: "codex-log",
+                message: "Codex 正在处理子任务",
+                threadId: latestActivity.threadId,
+                workspace: nil,
+                updatedAt: isoString(from: latestActivity.date)
+            )
+        }
+
+        return nil
+    }
+
+    private static func status(for event: ResponseEvent, row: LogRow) -> CodexStatus? {
+        switch event {
+        case .inProgress:
+            return CodexStatus(
+                state: .working,
+                event: "response.in_progress",
+                source: "codex-log",
+                message: "Codex 正在响应",
+                threadId: row.threadId,
+                workspace: nil,
+                updatedAt: isoString(from: row.date)
+            )
+        case .failed:
+            return CodexStatus(
+                state: .error,
+                event: "response.failed",
+                source: "codex-log",
+                message: "Codex 响应出错",
+                threadId: row.threadId,
+                workspace: nil,
+                updatedAt: isoString(from: row.date)
+            )
+        case .completed:
+            return nil
+        }
+    }
+
+    private static func isInteresting(_ body: String) -> Bool {
+        responseEvent(body) != nil || isActivity(body)
+    }
+
+    private static func isActivity(_ body: String) -> Bool {
+        body.contains("response.in_progress")
+            || body.contains("dispatch_tool_call")
+            || body.contains("tool_name=")
+            || body.contains("function_call")
+            || body.contains("codex-auto-review")
+            || body.contains("hook/started")
+            || body.contains("hook/completed")
+    }
+
+    private static func responseEvent(_ body: String) -> ResponseEvent? {
+        if body.contains("response.failed") {
+            return .failed
+        }
+        if body.contains("response.in_progress") {
+            return .inProgress
+        }
+        if body.contains("response.completed") {
+            return .completed
+        }
+        return nil
+    }
+
+    private static func isAutoReview(_ body: String) -> Bool {
+        body.contains("codex-auto-review")
+    }
+
+    private static func queryRecentRows(_ query: String) -> [LogRow] {
+        var rows: [LogRow] = []
         var database: OpaquePointer?
         guard sqlite3_open_v2(logsDatabase.path, &database, SQLITE_OPEN_READONLY | SQLITE_OPEN_FULLMUTEX, nil) == SQLITE_OK else {
-            return nil
+            return []
         }
         defer { sqlite3_close(database) }
 
         var statement: OpaquePointer?
         guard sqlite3_prepare_v2(database, query, -1, &statement, nil) == SQLITE_OK else {
-            return nil
+            return []
         }
         defer { sqlite3_finalize(statement) }
 
-        guard sqlite3_step(statement) == SQLITE_ROW else {
-            return nil
+        while sqlite3_step(statement) == SQLITE_ROW {
+            let ts = sqlite3_column_int64(statement, 0)
+            let body = sqlite3_column_text(statement, 1).map { String(cString: $0) } ?? ""
+            let threadId = sqlite3_column_text(statement, 2).map { String(cString: $0) }
+            rows.append(LogRow(ts: ts, body: body, threadId: threadId))
         }
 
-        let ts = sqlite3_column_int64(statement, 0)
-        let body = sqlite3_column_text(statement, 1).map { String(cString: $0) } ?? ""
-        let threadId = sqlite3_column_text(statement, 2).map { String(cString: $0) }
-        return (ts, body, threadId)
+        return rows
     }
 
     private static func parseDate(_ value: String?) -> Date? {
