@@ -103,6 +103,7 @@ enum CodexLogMonitor {
 
     private static let recentActivityWindowSeconds: TimeInterval = 15
     private static let completionDebounceSeconds: TimeInterval = 8
+    private static let autoReviewHoldSeconds: TimeInterval = 90
 
     private static var logsDatabase: URL {
         FileManager.default.homeDirectoryForCurrentUser
@@ -158,7 +159,15 @@ enum CodexLogMonitor {
         }
 
         if let latestMainResponse {
-            return status(for: latestMainResponse.event, row: latestMainResponse.row, latestActivity: latestActivity)
+            let blockingAutoReview = latestMainResponse.event == .completed
+                ? blockingAutoReview(after: latestMainResponse.row, in: rows)
+                : nil
+            return status(
+                for: latestMainResponse.event,
+                row: latestMainResponse.row,
+                latestActivity: latestActivity,
+                blockingAutoReview: blockingAutoReview
+            )
         }
 
         if let latestActivity, Date().timeIntervalSince(latestActivity.date) < recentActivityWindowSeconds {
@@ -176,7 +185,12 @@ enum CodexLogMonitor {
         return nil
     }
 
-    private static func status(for event: ResponseEvent, row: LogRow, latestActivity: LogRow?) -> CodexStatus? {
+    private static func status(
+        for event: ResponseEvent,
+        row: LogRow,
+        latestActivity: LogRow?,
+        blockingAutoReview: LogRow?
+    ) -> CodexStatus? {
         switch event {
         case .inProgress:
             return CodexStatus(
@@ -199,13 +213,14 @@ enum CodexLogMonitor {
                 updatedAt: isoString(from: row.date)
             )
         case .completed:
-            let newestActivityDate = [row.date, latestActivity?.date].compactMap { $0 }.max() ?? row.date
-            let isStable = Date().timeIntervalSince(newestActivityDate) >= completionDebounceSeconds
+            let newestActivityDate = [row.date, latestActivity?.date, blockingAutoReview?.date].compactMap { $0 }.max() ?? row.date
+            let isStable = blockingAutoReview == nil
+                && Date().timeIntervalSince(newestActivityDate) >= completionDebounceSeconds
             return CodexStatus(
                 state: isStable ? .complete : .working,
                 event: "response.completed",
                 source: "codex-log",
-                message: isStable ? "Codex 响应完成" : "Codex 正在收尾",
+                message: isStable ? "Codex 响应完成" : completionPendingMessage(blockingAutoReview: blockingAutoReview),
                 threadId: row.threadId,
                 workspace: nil,
                 updatedAt: isoString(from: newestActivityDate)
@@ -218,30 +233,176 @@ enum CodexLogMonitor {
     }
 
     private static func isActivity(_ body: String) -> Bool {
-        body.contains("response.in_progress")
-            || body.contains("dispatch_tool_call")
-            || body.contains("tool_name=")
-            || body.contains("function_call")
-            || body.contains("codex-auto-review")
-            || body.contains("hook/started")
-            || body.contains("hook/completed")
+        hasResponseEvent("response.in_progress", in: body)
+            || isToolActivity(body)
+            || isAutoReview(body)
+            || isHookEvent(body)
     }
 
     private static func responseEvent(_ body: String) -> ResponseEvent? {
-        if body.contains("response.failed") {
+        if hasResponseEvent("response.failed", in: body) {
             return .failed
         }
-        if body.contains("response.in_progress") {
+        if hasResponseEvent("response.in_progress", in: body) {
             return .inProgress
         }
-        if body.contains("response.completed") {
+        if hasResponseEvent("response.completed", in: body) {
             return .completed
         }
         return nil
     }
 
+    private static func hasResponseEvent(_ eventName: String, in body: String) -> Bool {
+        isSSEEvent(eventName, in: body)
+            || isOtelSSEEvent(eventName, in: body)
+            || body.hasPrefix("unhandled responses event: \(eventName)")
+    }
+
+    private static func isSSEEvent(_ eventName: String, in body: String) -> Bool {
+        body.hasPrefix("SSE event: {\"type\":\"\(eventName)\"")
+    }
+
+    private static func isOtelSSEEvent(_ eventName: String, in body: String) -> Bool {
+        guard body.contains("event.kind=\(eventName)") else {
+            return false
+        }
+
+        return body.hasPrefix("event.name=\"codex.sse_event\"")
+    }
+
+    private static func isToolActivity(_ body: String) -> Bool {
+        if body.hasPrefix("SSE event: {\"type\":\"response.output_item.done\"") {
+            return body.contains("\"item\":{\"id\":\"fc_")
+                && body.contains("\"type\":\"function_call\"")
+        }
+
+        if body.hasPrefix("SSE event: {\"type\":\"response.function_call_arguments.") {
+            return true
+        }
+
+        if body.hasPrefix("unhandled responses event: response.function_call_arguments.") {
+            return true
+        }
+
+        guard body.hasPrefix("session_loop{") else {
+            return false
+        }
+
+        return body.contains("otel.name=\"function_call\"")
+            || body.contains(":dispatch_tool_call")
+            || body.contains("dispatch_tool_call{")
+            || body.contains("dispatch_tool_call_with_code_mode_result")
+            || body.contains(" tool_name=")
+    }
+
+    private static func isHookEvent(_ body: String) -> Bool {
+        body.hasPrefix("app-server event: hook/started")
+            || body.hasPrefix("app-server event: hook/completed")
+    }
+
     private static func isAutoReview(_ body: String) -> Bool {
-        body.contains("codex-auto-review")
+        if let turnHeader = turnHeader(in: body) {
+            return turnHeader.contains("model=codex-auto-review")
+                || turnHeader.contains("model=\"codex-auto-review\"")
+        }
+
+        let containsAutoReviewModel = body.contains(" model=codex-auto-review")
+            || body.contains(" model=\"codex-auto-review\"")
+            || body.contains(" slug=codex-auto-review")
+
+        guard containsAutoReviewModel else {
+            return false
+        }
+
+        return body.hasPrefix("event.name=\"codex.api_request\"")
+            || body.hasPrefix("event.name=\"codex.sse_event\"")
+            || body.hasPrefix("event.name=\"codex.turn_ttft\"")
+            || body.hasPrefix("event.name=\"codex.user_prompt\"")
+    }
+
+    private static func blockingAutoReview(after completedResponse: LogRow, in rows: [LogRow]) -> LogRow? {
+        var completedTurnIds = Set<String>()
+        var completedTurnWithoutId = false
+
+        for row in rows {
+            guard row.ts >= completedResponse.ts else {
+                break
+            }
+
+            let body = row.body
+            guard isAutoReview(body) else {
+                continue
+            }
+
+            let turnId = turnId(in: body)
+            if isAutoReviewTerminal(body) {
+                if let turnId {
+                    completedTurnIds.insert(turnId)
+                } else {
+                    completedTurnWithoutId = true
+                }
+                continue
+            }
+
+            if let turnId, completedTurnIds.contains(turnId) {
+                continue
+            }
+
+            if turnId == nil && completedTurnWithoutId {
+                continue
+            }
+
+            if Date().timeIntervalSince(row.date) < autoReviewHoldSeconds {
+                return row
+            }
+        }
+
+        return nil
+    }
+
+    private static func isAutoReviewTerminal(_ body: String) -> Bool {
+        isAutoReview(body) && (
+            body.contains(":run_turn: post sampling token usage")
+                || body.contains(": skipping active goal continuation")
+        )
+    }
+
+    private static func completionPendingMessage(blockingAutoReview: LogRow?) -> String {
+        blockingAutoReview == nil ? "Codex 正在收尾" : "Codex 正在审查操作"
+    }
+
+    private static func turnHeader(in body: String) -> String? {
+        guard body.hasPrefix("session_loop{"),
+              let startRange = body.range(of: ":turn{") else {
+            return nil
+        }
+
+        let start = startRange.upperBound
+        guard let end = body[start...].firstIndex(of: "}") else {
+            return nil
+        }
+
+        return String(body[start..<end])
+    }
+
+    private static func turnId(in body: String) -> String? {
+        fieldValue(after: "turn.id=", in: body)
+            ?? fieldValue(after: "turn_id=", in: body)
+    }
+
+    private static func fieldValue(after marker: String, in body: String) -> String? {
+        guard let markerRange = body.range(of: marker) else {
+            return nil
+        }
+
+        let valueStart = markerRange.upperBound
+        let tail = body[valueStart...]
+        let valueEnd = tail.firstIndex { character in
+            character == " " || character == "}" || character == ":"
+        } ?? body.endIndex
+        let value = body[valueStart..<valueEnd].trimmingCharacters(in: CharacterSet(charactersIn: "\""))
+
+        return value.isEmpty ? nil : value
     }
 
     private static func queryRecentRows(_ query: String) -> [LogRow] {
