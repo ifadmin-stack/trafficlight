@@ -111,6 +111,10 @@ enum CodexLogMonitor {
             .appendingPathComponent("logs_2.sqlite", isDirectory: false)
     }
 
+    static var logsDatabaseModificationDate: Date? {
+        (try? logsDatabase.resourceValues(forKeys: [.contentModificationDateKey]))?.contentModificationDate
+    }
+
     static func latestStatus(after fileStatus: CodexStatus) -> CodexStatus? {
         let query = """
         select ts, feedback_log_body, thread_id
@@ -699,17 +703,21 @@ final class DashboardView: NSView {
 final class AppDelegate: NSObject, NSApplicationDelegate {
     private var statusItem: NSStatusItem?
     private let dashboardView = DashboardView(frame: NSRect(x: 0, y: 0, width: 300, height: 258))
+    private let logPollInterval: TimeInterval = 1.65
     private var currentStatus = CodexStatus.initial
     private var phase = false
     private var timer: Timer?
+    private var lastStatusFile: URL?
     private var lastModificationDate: Date?
+    private var lastLogPollDate: Date?
+    private var lastLogDatabaseModificationDate: Date?
     private var lastRenderedStatus: CodexStatus?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory)
         setupStatusItem()
         reloadStatus(force: true)
-        reloadCodexLogStatus()
+        reloadCodexLogStatus(force: true)
         render()
 
         timer = Timer.scheduledTimer(
@@ -762,7 +770,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func tick() {
         phase.toggle()
         reloadStatus(force: false)
-        reloadCodexLogStatus()
+        reloadCodexLogStatus(force: false)
         render()
     }
 
@@ -770,10 +778,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let fileURL = activeStatusFile()
         let modificationDate = (try? fileURL.resourceValues(forKeys: [.contentModificationDateKey]))?.contentModificationDate
 
-        guard force || modificationDate != lastModificationDate else {
+        guard force || fileURL != lastStatusFile || modificationDate != lastModificationDate else {
             return
         }
 
+        lastStatusFile = fileURL
         lastModificationDate = modificationDate
 
         guard let data = try? Data(contentsOf: fileURL) else {
@@ -803,14 +812,42 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         if FileManager.default.fileExists(atPath: StatusPaths.statusFile.path) {
             return StatusPaths.statusFile
         }
+        if FileManager.default.fileExists(atPath: StatusPaths.legacyStatusFile.path) {
+            return StatusPaths.legacyStatusFile
+        }
         return StatusPaths.legacyStatusFile
     }
 
-    private func reloadCodexLogStatus() {
+    private func reloadCodexLogStatus(force: Bool) {
+        guard shouldReloadCodexLogStatus(force: force) else {
+            return
+        }
+
         guard let status = CodexLogMonitor.latestStatus(after: currentStatus) else {
             return
         }
         currentStatus = status
+    }
+
+    private func shouldReloadCodexLogStatus(force: Bool) -> Bool {
+        let now = Date()
+        if !force, let lastLogPollDate, now.timeIntervalSince(lastLogPollDate) < logPollInterval {
+            return false
+        }
+
+        lastLogPollDate = now
+
+        let modificationDate = CodexLogMonitor.logsDatabaseModificationDate
+        let needsCompletionDebounceUpdate = currentStatus.source == "codex-log"
+            && currentStatus.event == "response.completed"
+            && currentStatus.state == .working
+
+        guard force || needsCompletionDebounceUpdate || modificationDate != lastLogDatabaseModificationDate else {
+            return false
+        }
+
+        lastLogDatabaseModificationDate = modificationDate
+        return true
     }
 
     private func render() {
@@ -824,29 +861,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     @objc private func revealStatusFile() {
-        let fileURL = StatusPaths.statusFile
+        let fileURL = activeStatusFile()
         if FileManager.default.fileExists(atPath: fileURL.path) {
             NSWorkspace.shared.activateFileViewerSelecting([fileURL])
         } else {
+            try? FileManager.default.createDirectory(
+                at: StatusPaths.appSupportDirectory,
+                withIntermediateDirectories: true
+            )
             NSWorkspace.shared.open(StatusPaths.appSupportDirectory)
         }
     }
 
     @objc private func copyStatusPath() {
         NSPasteboard.general.clearContents()
-        NSPasteboard.general.setString(StatusPaths.statusFile.path, forType: .string)
+        NSPasteboard.general.setString(activeStatusFile().path, forType: .string)
     }
 
     @objc private func quit() {
         NSApp.terminate(nil)
-    }
-}
-
-private extension JSONEncoder {
-    static var prettyPrinted: JSONEncoder {
-        let encoder = JSONEncoder()
-        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
-        return encoder
     }
 }
 

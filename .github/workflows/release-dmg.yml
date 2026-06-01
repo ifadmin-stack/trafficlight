@@ -28,13 +28,24 @@ jobs:
       - name: Ensure scripts are executable
         run: chmod +x ./scripts/build-app-bundle
 
+      - name: Resolve version
+        id: version
+        run: |
+          if [ "$GITHUB_REF_TYPE" = "tag" ]; then
+            VERSION="${GITHUB_REF_NAME#v}"
+          else
+            VERSION="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' Resources/Info.plist)"
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
       - name: Build app bundle
-        run: ./scripts/build-app-bundle
+        run: |
+          ./scripts/build-app-bundle --version "${{ steps.version.outputs.version }}" --build "$GITHUB_RUN_NUMBER"
 
       - name: Package DMG
         id: package
         run: |
-          VERSION="${GITHUB_REF_NAME#v}"
+          VERSION="${{ steps.version.outputs.version }}"
           DMG_NAME="CodexTrafficLight-macos-arm64-${VERSION}.dmg"
           hdiutil create \
             -volname "CodexTrafficLight" \

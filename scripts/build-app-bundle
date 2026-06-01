@@ -7,6 +7,43 @@ APP_DIR="$ROOT_DIR/.build/$APP_NAME.app"
 CONTENTS_DIR="$APP_DIR/Contents"
 MACOS_DIR="$CONTENTS_DIR/MacOS"
 RESOURCES_DIR="$CONTENTS_DIR/Resources"
+INFO_PLIST="$CONTENTS_DIR/Info.plist"
+
+usage() {
+  echo "usage: build-app-bundle [--version VERSION] [--build BUILD]"
+}
+
+VERSION="${CODEX_TRAFFICLIGHT_VERSION:-}"
+BUILD_NUMBER="${CODEX_TRAFFICLIGHT_BUILD:-}"
+
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    --version)
+      VERSION="${2:?missing value for --version}"
+      shift 2
+      ;;
+    --version=*)
+      VERSION="${1#--version=}"
+      shift
+      ;;
+    --build)
+      BUILD_NUMBER="${2:?missing value for --build}"
+      shift 2
+      ;;
+    --build=*)
+      BUILD_NUMBER="${1#--build=}"
+      shift
+      ;;
+    *)
+      usage >&2
+      exit 2
+      ;;
+  esac
+done
 
 cd "$ROOT_DIR"
 swift build -c release --arch arm64
@@ -14,7 +51,13 @@ swift build -c release --arch arm64
 rm -rf "$APP_DIR"
 mkdir -p "$MACOS_DIR" "$RESOURCES_DIR"
 cp "$ROOT_DIR/.build/arm64-apple-macosx/release/$APP_NAME" "$MACOS_DIR/$APP_NAME"
-cp "$ROOT_DIR/Resources/Info.plist" "$CONTENTS_DIR/Info.plist"
+cp "$ROOT_DIR/Resources/Info.plist" "$INFO_PLIST"
+if [ -n "$VERSION" ]; then
+  /usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString $VERSION" "$INFO_PLIST"
+fi
+if [ -n "$BUILD_NUMBER" ]; then
+  /usr/libexec/PlistBuddy -c "Set :CFBundleVersion $BUILD_NUMBER" "$INFO_PLIST"
+fi
 if [ -f "$ROOT_DIR/Resources/AppIcon.icns" ]; then
   cp "$ROOT_DIR/Resources/AppIcon.icns" "$RESOURCES_DIR/AppIcon.icns"
 fi
